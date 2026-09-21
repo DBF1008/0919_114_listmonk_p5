@@ -1,10 +1,10 @@
 package main
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/knadh/listmonk/internal/auth"
@@ -73,32 +73,41 @@ func (a *App) ImportSubscribers(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer src.Close()
-
-	// Copy it to a temp location.
-	out, err := os.CreateTemp("", "listmonk")
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError,
-			a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
-	}
-	defer out.Close()
-
-	if _, err = io.Copy(out, src); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError,
-			a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
-	}
 
 	// Start the importer session.
 	opt.Filename = file.Filename
 	sess, err := a.importer.NewSession(opt)
 	if err != nil {
+		_ = src.Close()
 		return echo.NewHTTPError(http.StatusInternalServerError,
 			a.i18n.Ts("import.errorStarting", "error", err.Error()))
 	}
 	go sess.Start()
 
 	if strings.HasSuffix(strings.ToLower(file.Filename), ".csv") {
-		go sess.LoadCSV(out.Name(), rune(opt.Delim[0]))
+		// Stream the upload directly. Count the lines first and rewind; the
+		// multipart upload is backed by a seekable file (in-memory or the
+		// server's multipart temp spool), so no extra temporary copy is needed.
+		numLines, err := subimporter.CountLines(src)
+		if err != nil {
+			_ = src.Close()
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
+		}
+		if _, err := src.Seek(0, io.SeekStart); err != nil {
+			_ = src.Close()
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
+		}
+
+		// The stream is consumed asynchronously, so it is closed here only
+		// once the import is done (instead of via defer at handler return).
+		go func() {
+			defer src.Close()
+			if err := sess.LoadCSV(src, numLines, rune(opt.Delim[0])); err != nil {
+				a.log.Printf("error importing CSV '%s': %v", file.Filename, err)
+			}
+		}()
 	} else {
 		// Only 1 CSV from the ZIP is considered. If multiple files have
 		// to be processed, counting the net number of lines (to track progress),
@@ -106,13 +115,64 @@ func (a *App) ImportSubscribers(c echo.Context) error {
 		// multiple files becomes complex. Instead, it's just easier for the
 		// end user to concat multiple CSVs (if there are multiple in the first)
 		// place and upload as one in the first place.
-		dir, files, err := sess.ExtractZIP(out.Name(), 1)
+		//
+		// The ZIP is read straight from the upload stream (multipart uploads
+		// implement io.ReaderAt), without extracting it to disk. The CSV entry
+		// is decompressed twice: once to count lines and once to import.
+		zr, err := zip.NewReader(src, file.Size)
 		if err != nil {
+			_ = src.Close()
 			return echo.NewHTTPError(http.StatusInternalServerError,
 				a.i18n.Ts("import.errorProcessingZIP", "error", err.Error()))
 		}
 
-		go sess.LoadCSV(dir+"/"+files[0], rune(opt.Delim[0]))
+		// Find the first .csv entry.
+		var zf *zip.File
+		for _, f := range zr.File {
+			if f.FileInfo().IsDir() {
+				continue
+			}
+			if !strings.HasSuffix(strings.ToLower(f.FileInfo().Name()), ".csv") {
+				continue
+			}
+			zf = f
+			break
+		}
+		if zf == nil {
+			_ = src.Close()
+			return echo.NewHTTPError(http.StatusInternalServerError, "no CSV files found in the ZIP")
+		}
+
+		// First decompression pass: count the lines for progress tracking.
+		rc, err := zf.Open()
+		if err != nil {
+			_ = src.Close()
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("import.errorProcessingZIP", "error", err.Error()))
+		}
+		numLines, err := subimporter.CountLines(rc)
+		_ = rc.Close()
+		if err != nil {
+			_ = src.Close()
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("import.errorProcessingZIP", "error", err.Error()))
+		}
+
+		// Second decompression pass: the actual import.
+		rc, err = zf.Open()
+		if err != nil {
+			_ = src.Close()
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("import.errorProcessingZIP", "error", err.Error()))
+		}
+
+		go func() {
+			defer src.Close()
+			defer rc.Close()
+			if err := sess.LoadCSV(rc, numLines, rune(opt.Delim[0])); err != nil {
+				a.log.Printf("error importing ZIP '%s': %v", file.Filename, err)
+			}
+		}()
 	}
 
 	return c.JSON(http.StatusOK, okResp{a.importer.GetStats()})

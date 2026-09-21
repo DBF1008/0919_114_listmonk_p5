@@ -7,7 +7,6 @@
 package subimporter
 
 import (
-	"archive/zip"
 	"bytes"
 	"database/sql"
 	"encoding/csv"
@@ -16,11 +15,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/knadh/listmonk/internal/i18n"
@@ -34,6 +32,15 @@ import (
 const (
 	// commitBatchSize is the number of inserts to commit in a single SQL transaction.
 	commitBatchSize = 10000
+
+	// maxRowErrors is the maximum number of row-level errors kept in memory for
+	// the end-of-import summary report. The total failed count is always tracked.
+	maxRowErrors = 1000
+
+	// checkpointKey is the `settings` table key under which the import resume
+	// checkpoint is persisted so that an interrupted import can resume after a
+	// service restart.
+	checkpointKey = "import.checkpoint"
 )
 
 // Various import statuses.
@@ -85,6 +92,12 @@ type Session struct {
 	log      *log.Logger
 
 	opt SessionOpt
+
+	// rowErrors holds the (capped) list of skipped rows for the summary report.
+	rowErrors []RowError
+
+	// failedCount is the total number of skipped rows (even beyond the cap).
+	failedCount int
 }
 
 // SessionOpt represents the options for an importer session.
@@ -101,11 +114,29 @@ type SessionOpt struct {
 
 // Status represents statistics from an ongoing import session.
 type Status struct {
-	Name     string `json:"name"`
-	Total    int    `json:"total"`
-	Imported int    `json:"imported"`
-	Status   string `json:"status"`
-	logBuf   *bytes.Buffer
+	Name      string    `json:"name"`
+	Total     int       `json:"total"`
+	Imported  int       `json:"imported"`
+	Failed    int       `json:"failed"`
+	Percent   float64   `json:"percent"`
+	ETA       int64     `json:"eta"`
+	Status    string    `json:"status"`
+	StartedAt time.Time `json:"started_at"`
+	logBuf    *bytes.Buffer
+}
+
+// RowError describes a single CSV row that was skipped during an import.
+type RowError struct {
+	Line   int    `json:"line"`
+	Reason string `json:"reason"`
+}
+
+// importCheckpoint is persisted to the DB so an interrupted import can resume
+// after a service restart by re-uploading the same file.
+type importCheckpoint struct {
+	Filename  string `json:"filename"`
+	Processed int    `json:"processed"`
+	Imported  int    `json:"imported"`
 }
 
 // SubReq is a wrapper over the Subscriber model.
@@ -121,6 +152,7 @@ type importStatusTpl struct {
 	Status   string
 	Imported int
 	Total    int
+	Failed   int
 }
 
 var (
@@ -179,8 +211,9 @@ func (im *Importer) NewSession(opt SessionOpt) (*Session, error) {
 
 	im.Lock()
 	im.status = Status{Status: StatusImporting,
-		Name:   opt.Filename,
-		logBuf: bytes.NewBuffer(nil)}
+		Name:      opt.Filename,
+		StartedAt: time.Now(),
+		logBuf:    bytes.NewBuffer(nil)}
 	im.Unlock()
 
 	s := &Session{
@@ -199,12 +232,49 @@ func (im *Importer) GetStats() Status {
 	im.RLock()
 	defer im.RUnlock()
 
-	return Status{
-		Name:     im.status.Name,
-		Status:   im.status.Status,
-		Total:    im.status.Total,
-		Imported: im.status.Imported,
+	s := Status{
+		Name:      im.status.Name,
+		Status:    im.status.Status,
+		Total:     im.status.Total,
+		Imported:  im.status.Imported,
+		Failed:    im.status.Failed,
+		StartedAt: im.status.StartedAt,
 	}
+
+	// Derive the progress percentage and the ETA from the elapsed time and the
+	// number of rows imported so far.
+	s.Percent, s.ETA = computeProgress(s.Total, s.Imported, s.StartedAt)
+
+	return s
+}
+
+// computeProgress returns the import progress percentage and the estimated
+// number of seconds remaining, based on the average import rate since start.
+func computeProgress(total, imported int, startedAt time.Time) (float64, int64) {
+	if total <= 0 || startedAt.IsZero() {
+		return 0, 0
+	}
+
+	percent := float64(imported) / float64(total) * 100
+	if percent > 100 {
+		percent = 100
+	}
+
+	var eta int64
+	if imported > 0 {
+		if elapsed := time.Since(startedAt).Seconds(); elapsed > 0 {
+			rate := float64(imported) / elapsed
+			if rate > 0 {
+				remaining := float64(total-imported) / rate
+				if remaining < 0 {
+					remaining = 0
+				}
+				eta = int64(remaining + 0.5)
+			}
+		}
+	}
+
+	return percent, eta
 }
 
 // GetLogs returns the log entries of the last import session.
@@ -253,6 +323,13 @@ func (im *Importer) incrementImportCount(n int) {
 	im.Unlock()
 }
 
+// incrementFailedCount increments the number of rows skipped due to errors.
+func (im *Importer) incrementFailedCount(n int) {
+	im.Lock()
+	im.status.Failed += n
+	im.Unlock()
+}
+
 // sendNotif sends admin notifications for import completions.
 func (im *Importer) sendNotif(status string) error {
 	var (
@@ -262,6 +339,7 @@ func (im *Importer) sendNotif(status string) error {
 			Status:   status,
 			Imported: s.Imported,
 			Total:    s.Total,
+			Failed:   s.Failed,
 		}
 		subject = fmt.Sprintf("%s: %s import", cases.Title(language.Und).String(status), s.Name)
 	)
@@ -335,8 +413,14 @@ func (s *Session) Start() {
 
 	// Queue's closed and there's nothing left to commit.
 	if cur == 0 {
+		// A manually stopped import keeps its checkpoint so it can be resumed.
+		if s.im.getStatus() != StatusStopping {
+			if err := s.im.clearCheckpoint(); err != nil {
+				s.log.Printf("error clearing import checkpoint: %v", err)
+			}
+		}
 		s.im.setStatus(StatusFinished)
-		s.log.Printf("imported finished")
+		s.logSummary()
 		if _, err := s.im.opt.UpdateListDateStmt.Exec(pq.Array(listIDs)); err != nil {
 			s.log.Printf("error updating lists date: %v", err)
 		}
@@ -353,9 +437,14 @@ func (s *Session) Start() {
 		return
 	}
 
+	if s.im.getStatus() != StatusStopping {
+		if err := s.im.clearCheckpoint(); err != nil {
+			s.log.Printf("error clearing import checkpoint: %v", err)
+		}
+	}
 	s.im.incrementImportCount(cur)
 	s.im.setStatus(StatusFinished)
-	s.log.Printf("imported finished")
+	s.logSummary()
 	if _, err := s.im.opt.UpdateListDateStmt.Exec(pq.Array(listIDs)); err != nil {
 		s.log.Printf("error updating lists date: %v", err)
 	}
@@ -368,92 +457,20 @@ func (s *Session) Stop() {
 	close(s.subQueue)
 }
 
-// ExtractZIP takes a ZIP file's path and extracts all .csv files in it to
-// a temporary directory, and returns the name of the temp directory and the
-// list of extracted .csv files.
-func (s *Session) ExtractZIP(srcPath string, maxCSVs int) (string, []string, error) {
-	if s.im.isDone() {
-		return "", nil, ErrIsImporting
-	}
-
-	failed := true
-	defer func() {
-		if failed {
-			s.im.setStatus(StatusFailed)
-		}
-	}()
-
-	z, err := zip.OpenReader(srcPath)
-	if err != nil {
-		return "", nil, err
-	}
-	defer z.Close()
-
-	// Create a temporary directory to extract the files.
-	dir, err := os.MkdirTemp("", "listmonk")
-	if err != nil {
-		s.log.Printf("error creating temporary directory for extracting ZIP: %v", err)
-		return "", nil, err
-	}
-
-	files := make([]string, 0, len(z.File))
-	for _, f := range z.File {
-		fName := f.FileInfo().Name()
-
-		// Skip directories.
-		if f.FileInfo().IsDir() {
-			s.log.Printf("skipping directory '%s'", fName)
-			continue
-		}
-
-		// Skip files without the .csv extension.
-		if !strings.HasSuffix(strings.ToLower(fName), ".csv") {
-			s.log.Printf("skipping non .csv file '%s'", fName)
-			continue
-		}
-
-		// Sanitize the file name to prevent ZIP slip path traversal.
-		fName = filepath.Base(fName)
-
-		s.log.Printf("extracting '%s'", fName)
-		src, err := f.Open()
-		if err != nil {
-			s.log.Printf("error opening '%s' from ZIP: '%v'", fName, err)
-			return "", nil, err
-		}
-		defer src.Close()
-
-		out, err := os.OpenFile(dir+"/"+fName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-		if err != nil {
-			s.log.Printf("error creating '%s/%s': '%v'", dir, fName, err)
-			return "", nil, err
-		}
-		defer out.Close()
-
-		if _, err := io.Copy(out, src); err != nil {
-			s.log.Printf("error extracting to '%s/%s': '%v'", dir, fName, err)
-			return "", nil, err
-		}
-		s.log.Printf("extracted '%s'", fName)
-
-		files = append(files, fName)
-		if len(files) > maxCSVs {
-			s.log.Printf("won't extract any more files. Maximum is %d", maxCSVs)
-			break
-		}
-	}
-
-	if len(files) == 0 {
-		s.log.Println("no CSV files found in the ZIP")
-		return "", nil, errors.New("no CSV files found in the ZIP")
-	}
-
-	failed = false
-	return dir, files, nil
-}
-
-// LoadCSV loads a CSV file and validates and imports the subscriber entries in it.
-func (s *Session) LoadCSV(srcPath string, delim rune) error {
+// LoadCSV streams a CSV from src and validates and imports the subscriber
+// entries in it. numLines is the total number of physical lines in the stream
+// (including the header) and is used to derive the progress percentage. The
+// caller should obtain it beforehand via CountLines (for seekable uploads this
+// means counting first and then rewinding; for ZIP entries, decompressing
+// twice). This keeps the import fully streaming and avoids copying the entire
+// upload to a temporary file.
+//
+// Malformed rows do not abort the import. They are skipped individually with
+// their line number and reason recorded, and a summary report is written to
+// the session log once the stream has been fully consumed. If a checkpoint
+// for the same filename exists in the DB (for example, after a service
+// restart), rows up to the checkpoint are skipped and the import resumes.
+func (s *Session) LoadCSV(src io.Reader, numLines int, delim rune) error {
 	if s.im.isDone() {
 		return ErrIsImporting
 	}
@@ -467,20 +484,6 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 		}
 	}()
 
-	f, err := os.Open(srcPath)
-	if err != nil {
-		return err
-	}
-
-	// Count the total number of lines in the file. This doesn't distinguish
-	// between "blank" and non "blank" lines, and is only used to derive
-	// the progress percentage for the frontend.
-	numLines, err := countLines(f)
-	if err != nil {
-		s.log.Printf("error counting lines in '%s': '%v'", srcPath, err)
-		return err
-	}
-
 	if numLines == 0 {
 		return errors.New("empty file")
 	}
@@ -490,28 +493,51 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 	s.im.status.Total = numLines - 1
 	s.im.Unlock()
 
-	// Rewind, now that we've done a linecount on the same handler.
-	_, _ = f.Seek(0, 0)
-	rd := csv.NewReader(f)
+	// Resume from a previously persisted checkpoint, if one exists for the
+	// same file and has rows left to process.
+	skip := 0
+	cp, err := s.im.loadCheckpoint()
+	if err != nil {
+		s.log.Printf("error loading import checkpoint: %v", err)
+	} else if cp.Filename == s.opt.Filename && cp.Processed > 0 {
+		if cp.Processed >= numLines-1 {
+			s.log.Printf("checkpoint for '%s' covers all %d rows; nothing to import", s.opt.Filename, numLines-1)
+			close(s.subQueue)
+			failed = false
+			return nil
+		}
+
+		skip = cp.Processed
+		if cp.Imported > 0 {
+			s.im.incrementImportCount(cp.Imported)
+		}
+		s.log.Printf("resuming import of '%s' from line %d (previously imported %d)", s.opt.Filename, skip, cp.Imported)
+	}
+
+	rd := csv.NewReader(src)
 	rd.Comma = delim
+	// Allow rows with varying field counts so malformed rows can be skipped
+	// individually (and recorded) instead of aborting the entire import.
+	rd.FieldsPerRecord = -1
 
 	// Read the header.
 	csvHdr, err := rd.Read()
 	if err != nil {
-		s.log.Printf("error reading header from '%s': '%v'", srcPath, err)
+		s.log.Printf("error reading CSV header: %v", err)
 		return err
 	}
 
 	hdrKeys := s.mapCSVHeaders(csvHdr, csvHeaders)
 	// email is a required header.
 	if _, ok := hdrKeys["email"]; !ok {
-		s.log.Printf("'email' column not found in '%s'", srcPath)
+		s.log.Printf("'email' column not found in '%s'", s.opt.Filename)
 		return errors.New("'email' column not found")
 	}
 
 	var (
-		lnHdr = len(hdrKeys)
-		i     = 0
+		lnHdr    = len(hdrKeys)
+		i        = 0
+		lastSave = 0
 	)
 	for {
 		i++
@@ -520,8 +546,10 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 		select {
 		case <-s.im.stop:
 			failed = false
+			s.persistCheckpoint(i)
 			close(s.subQueue)
 			s.log.Println("stop request received")
+			s.logSummary()
 			return nil
 		default:
 		}
@@ -529,19 +557,37 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 		cols, err := rd.Read()
 		if err == io.EOF {
 			break
-		} else if err != nil {
-			if err, ok := err.(*csv.ParseError); ok && err.Err == csv.ErrFieldCount {
-				s.log.Printf("skipping line %d. %v", i, err)
-				continue
-			} else {
-				s.log.Printf("error reading CSV '%s'", err)
-				return err
-			}
+		}
+		if err != nil {
+			// Any row-level parse error: skip the row and continue instead of
+			// failing the entire batch.
+			reason := fmt.Sprintf("CSV parse error: %v", err)
+			s.recordError(i, reason)
+			s.log.Printf("skipping line %d: %v", i, err)
+
+			// A parse error can leave the reader positioned mid-record;
+			// csv.Reader resynchronizes to the next line on the next Read.
+			continue
+		}
+
+		// Persist the rows read so far periodically so the import can resume
+		// after a crash/restart. The DB upserts are idempotent, so rows that
+		// were queued but not yet committed may be reprocessed on resume safely.
+		if i-lastSave >= commitBatchSize {
+			s.persistCheckpoint(i)
+			lastSave = i
+		}
+
+		// Skip rows already processed before a restart (checkpoint resume).
+		if i <= skip {
+			continue
 		}
 
 		lnCols := len(cols)
 		if lnCols < lnHdr {
-			s.log.Printf("skipping line %d. column count (%d) does not match minimum header count (%d)", i, lnCols, lnHdr)
+			reason := fmt.Sprintf("column count (%d) is fewer than the header count (%d)", lnCols, lnHdr)
+			s.recordError(i, reason)
+			s.log.Printf("skipping line %d. %s", i, reason)
 			continue
 		}
 
@@ -561,6 +607,7 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 
 		sub, err = s.im.ValidateFields(sub)
 		if err != nil {
+			s.recordError(i, err.Error())
 			s.log.Printf("skipping line %d: %v: %v", i, err, cols)
 			continue
 		}
@@ -584,8 +631,94 @@ func (s *Session) LoadCSV(srcPath string, delim rune) error {
 
 	close(s.subQueue)
 	failed = false
+	s.logSummary()
 
 	return nil
+}
+
+// recordError records a skipped CSV row (line number and reason) for the
+// end-of-import summary report and bumps the failed counter.
+func (s *Session) recordError(line int, reason string) {
+	s.failedCount++
+	s.im.incrementFailedCount(1)
+	if len(s.rowErrors) < maxRowErrors {
+		s.rowErrors = append(s.rowErrors, RowError{Line: line, Reason: reason})
+	}
+}
+
+// persistCheckpoint writes the current progress to the DB so the import can
+// resume after a service restart.
+func (s *Session) persistCheckpoint(processed int) {
+	if err := s.im.saveCheckpoint(importCheckpoint{
+		Filename:  s.opt.Filename,
+		Processed: processed,
+		Imported:  s.im.GetStats().Imported,
+	}); err != nil {
+		s.log.Printf("error persisting import checkpoint at line %d: %v", processed, err)
+	}
+}
+
+// logSummary writes the end-of-import summary report (rows read, imported,
+// failed and per-row error details) to the session log.
+func (s *Session) logSummary() {
+	st := s.im.GetStats()
+	s.log.Printf("import summary for '%s': %d/%d rows imported, %d rows skipped", st.Name, st.Imported, st.Total, s.failedCount)
+	if s.failedCount == 0 {
+		return
+	}
+
+	s.log.Printf("skipped rows (line: reason):")
+	for _, re := range s.rowErrors {
+		s.log.Printf("  line %d: %s", re.Line, re.Reason)
+	}
+	if s.failedCount > len(s.rowErrors) {
+		s.log.Printf("  ... and %d more skipped rows (capped at %d)", s.failedCount-len(s.rowErrors), maxRowErrors)
+	}
+}
+
+// saveCheckpoint upserts the import resume checkpoint into the settings table.
+func (im *Importer) saveCheckpoint(cp importCheckpoint) error {
+	if im.db == nil {
+		return nil
+	}
+
+	b, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+
+	_, err = im.db.Exec(`INSERT INTO settings (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`, checkpointKey, b)
+	return err
+}
+
+// loadCheckpoint loads a previously persisted import checkpoint. A missing
+// checkpoint returns a zero-value checkpoint with no error.
+func (im *Importer) loadCheckpoint() (importCheckpoint, error) {
+	var cp importCheckpoint
+	if im.db == nil {
+		return cp, nil
+	}
+
+	var b []byte
+	if err := im.db.QueryRow(`SELECT value FROM settings WHERE key = $1`, checkpointKey).Scan(&b); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return cp, nil
+		}
+		return cp, err
+	}
+
+	return cp, json.Unmarshal(b, &cp)
+}
+
+// clearCheckpoint removes the import resume checkpoint after a successful import.
+func (im *Importer) clearCheckpoint() error {
+	if im.db == nil {
+		return nil
+	}
+
+	_, err := im.db.Exec(`DELETE FROM settings WHERE key = $1`, checkpointKey)
+	return err
 }
 
 // Stop sends a signal to stop the existing import.
@@ -711,10 +844,10 @@ func (s *Session) mapCSVHeaders(csvHdrs []string, knownHdrs map[string]bool) map
 	return hdrKeys
 }
 
-// countLines counts the number of line breaks in a file. This does not
+// CountLines counts the number of line breaks in a stream. This does not
 // distinguish between "blank" and non "blank" lines.
 // Credit: https://stackoverflow.com/a/24563853
-func countLines(r io.Reader) (int, error) {
+func CountLines(r io.Reader) (int, error) {
 	var (
 		buf      = make([]byte, 32*1024)
 		count    = 0
