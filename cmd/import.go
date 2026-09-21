@@ -73,46 +73,61 @@ func (a *App) ImportSubscribers(c echo.Context) error {
 	if err != nil {
 		return err
 	}
-	defer src.Close()
-
-	// Copy it to a temp location.
-	out, err := os.CreateTemp("", "listmonk")
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError,
-			a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
-	}
-	defer out.Close()
-
-	if _, err = io.Copy(out, src); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError,
-			a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
-	}
 
 	// Start the importer session.
 	opt.Filename = file.Filename
 	sess, err := a.importer.NewSession(opt)
 	if err != nil {
+		src.Close()
 		return echo.NewHTTPError(http.StatusInternalServerError,
 			a.i18n.Ts("import.errorStarting", "error", err.Error()))
 	}
 	go sess.Start()
 
+	// Capture the multipart form so the uploaded temp file (if any) can be
+	// cleaned up once the import goroutine is done reading it. The echo
+	// context itself must not be touched from the goroutine as it's
+	// recycled after the handler returns.
+	mpForm := c.Request().MultipartForm
+
 	if strings.HasSuffix(strings.ToLower(file.Filename), ".csv") {
-		go sess.LoadCSV(out.Name(), rune(opt.Delim[0]))
+		// Stream the uploaded CSV straight into the importer without
+		// copying it to disk first. The goroutine takes ownership of src.
+		go func() {
+			defer mpForm.RemoveAll()
+			defer src.Close()
+			if err := sess.LoadCSV(src, file.Size, rune(opt.Delim[0])); err != nil {
+				lo.Printf("error importing CSV '%s': %v", file.Filename, err)
+			}
+		}()
 	} else {
-		// Only 1 CSV from the ZIP is considered. If multiple files have
-		// to be processed, counting the net number of lines (to track progress),
-		// keeping the global import state (failed / successful) etc. across
-		// multiple files becomes complex. Instead, it's just easier for the
-		// end user to concat multiple CSVs (if there are multiple in the first)
-		// place and upload as one in the first place.
-		dir, files, err := sess.ExtractZIP(out.Name(), 1)
+		// ZIP handling needs random access (the central directory is at
+		// the end of the file), so the compressed upload is copied to a
+		// temp file. The CSV inside is streamed out of the ZIP without
+		// being extracted to disk, and the temp ZIP is deleted afterwards.
+		out, err := os.CreateTemp("", "listmonk")
 		if err != nil {
+			src.Close()
 			return echo.NewHTTPError(http.StatusInternalServerError,
-				a.i18n.Ts("import.errorProcessingZIP", "error", err.Error()))
+				a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
 		}
 
-		go sess.LoadCSV(dir+"/"+files[0], rune(opt.Delim[0]))
+		if _, err = io.Copy(out, src); err != nil {
+			out.Close()
+			os.Remove(out.Name())
+			src.Close()
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("import.errorCopyingFile", "error", err.Error()))
+		}
+		src.Close()
+		out.Close()
+		mpForm.RemoveAll()
+
+		go func() {
+			if err := sess.LoadZIP(out.Name(), rune(opt.Delim[0])); err != nil {
+				lo.Printf("error importing ZIP '%s': %v", file.Filename, err)
+			}
+		}()
 	}
 
 	return c.JSON(http.StatusOK, okResp{a.importer.GetStats()})
